@@ -37,6 +37,10 @@ on:
         description: '走 ci.py 只跑名字含这些子串的几条（逗号分隔）。留空 = 全部'
         required: false
         default: ''
+      diagnose_twin:
+        description: '跑"孪生二进制段错误"的定向探针（写死的固定步骤，不是任意命令）。true = 跑'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -52,22 +56,31 @@ jobs:
       # 装门禁要的外部命令。名单是实测出来的
       # （`grep -rho 'which("...")' tools/*.py`）: clang 45 处，还有
       # llvm-objdump/nm/ar、qemu-system-x86_64/qemu-aarch64、rustc、java、go、vim、node。
-      # 第一轮的环境自述证明这套已经够（只缺不需要的 nvim），所以后面再红就不是环境了。
+      # 第一轮的环境自述证明**命令清单**已经够（只缺不需要的 nvim）—— 但**版本**不够:
+      # 见下面 LLVM 那一段。
       - name: 装工具链
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq \
-            clang lld llvm \
             qemu-system-x86 qemu-user \
             golang-go default-jdk \
             nodejs npm vim
-          # Ubuntu 上 llvm-* 常只有带版本号的名字，而门禁按不带版本号的名字找。
-          for t in llvm-objdump llvm-nm llvm-ar; do
-            if ! command -v "$t" >/dev/null 2>&1; then
-              s="$(ls /usr/bin/$t-* 2>/dev/null | sort -V | tail -1 || true)"
-              if [ -n "$s" ]; then sudo ln -sf "$s" "/usr/bin/$t"; fi
+          # 仓里发出的 IR 用 `#dbg_declare` —— 那是 **LLVM 19** 起的调试记录语法。
+          # ubuntu-24.04 自带的 clang 是 **18**，于是在 `--debug` 那几条判据上报
+          # `error: expected instruction opcode`（`loment_p7_test` 的符号化器、
+          # `loment_tools_test` 的 m59 三条）。本机能过是因为本机 LLVM 是 22。
+          # 版本下限写在 CONTRIBUTING「Getting a toolchain」。
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          # 让不带版本号的名字指向 19（/usr/local/bin 在 PATH 里排在 /usr/bin 前面）。
+          for t in clang clang++ lld ld.lld llvm-objdump llvm-nm llvm-ar; do
+            if [ -x "/usr/lib/llvm-19/bin/$t" ]; then
+              sudo ln -sf "/usr/lib/llvm-19/bin/$t" "/usr/local/bin/$t"
             fi
           done
+          clang --version | head -1
+          llvm-objdump --version | head -1
 
       # 先自述环境 —— 这样"红"才有归因: 是仓库的问题，还是这个 runner 上没有那个命令。
       - name: 环境自述
@@ -75,6 +88,8 @@ jobs:
           echo "runner: $(uname -a)"
           echo "python: $(python3 -V)"
           echo "cpu: $(nproc)"
+          echo "clang: $(clang --version | head -1)"
+          echo "llvm-objdump: $(llvm-objdump --version | head -1)"
           for t in clang clang++ lld ld.lld llvm-objdump llvm-nm llvm-ar rustc cargo \
                    qemu-system-x86_64 qemu-aarch64 go java javac node npm vim nvim \
                    python3 git sh; do
@@ -103,9 +118,42 @@ jobs:
             rm -f "$out"
           done
 
+      # 用法 4: 定向探针 —— 三条套件里的自举孪生二进制在 runner 上段错误（rc=-11），
+      # 而本机（WSL，也是 Linux）全绿。这类事猜不出来，只能在 runner 上直接看。
+      # **写死的固定步骤**，不做"任意命令"输入（这是公开仓）。
+      - name: 探针 —— 孪生二进制的段错误
+        if: ${{ github.event.inputs.diagnose_twin == 'true' }}
+        run: |
+          set +e
+          echo "### 地址布局 / 内核"
+          echo "（上一轮已排除的两类：关 ASLR 与放大栈都没有改变结果）"
+          echo "randomize_va_space: $(cat /proc/sys/kernel/randomize_va_space)"
+          uname -a
+          echo "cpu: $(nproc)"
+          echo
+          echo "### 控制组：直接跑（预期红 —— 孪生 rc=-11）"
+          timeout 600 python3 tools/potato_test.py 2>&1 | tail -8
+          echo
+          echo "### 段错误地址（dmesg 那一行还带着出错指令的 ip）"
+          sudo dmesg 2>/dev/null | grep -iE "segfault|trap" | tail -4 \
+            || echo "（dmesg 拿不到：kernel.dmesg_restrict）"
+          echo
+          echo "### gdb 跟着子进程抓现场：出错指令 + 周围的指令 + 寄存器里的坏地址"
+          echo "### （固定 ip 说明同一个代码点拿到坏参数；rdi/rsi 就是那个参数）"
+          sudo apt-get install -y -qq gdb
+          timeout 900 gdb -batch -q \
+            -ex "set follow-fork-mode child" \
+            -ex "set detach-on-fork off" \
+            -ex "set confirm off" \
+            -ex run \
+            -ex "info registers rip rax rbx rcx rdx rsi rdi rbp rsp" \
+            -ex "x/10i \$rip-16" \
+            -ex "bt" \
+            --args python3 tools/potato_test.py 2>&1 | tail -70
+
       # 用法 1/3: 跑整道门禁（或只跑几条）。红项留给下一步汇总，不让它把 job 弄挂。
       - name: 跑静态门禁
-        if: ${{ github.event.inputs.suite == '' }}
+        if: ${{ github.event.inputs.suite == '' && github.event.inputs.diagnose_twin != 'true' }}
         run: |
           if [ -n "${{ github.event.inputs.only }}" ]; then
             args=""
@@ -119,7 +167,7 @@ jobs:
           tail -40 gate.out
 
       - name: 汇总
-        if: ${{ always() && github.event.inputs.suite == '' }}
+        if: ${{ always() && github.event.inputs.suite == '' && github.event.inputs.diagnose_twin != 'true' }}
         run: |
           pass=$(grep -c ':: \[static\].*PASS' gate.out || true)
           fail=$(grep -c ':: \[static\].*FAIL' gate.out || true)
@@ -141,7 +189,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
-        if: ${{ always() && github.event.inputs.suite == '' }}
+        if: ${{ always() && github.event.inputs.suite == '' && github.event.inputs.diagnose_twin != 'true' }}
         with:
           name: gate-log
           path: gate.out

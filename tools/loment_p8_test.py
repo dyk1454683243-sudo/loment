@@ -973,7 +973,10 @@ def test_m87_driver_strips_grammar_decl():
 
       * **抹掉之后不留痕**: 带声明的那份与不带的那份 **产物逐字节相同**。对照面是
         **另一个单元**, 不是参考实现 —— 两个实现**一起**错(比如都多抹了一行)时,
-        "自举 == 参考"照样绿 (`docs/182` §1.9 那条形状);
+        "自举 == 参考"照样绿 (`docs/182` §1.9 那条形状)。**原生拼法有两个, 两个都验**:
+        `decl.lomt`(拼 `loment`) 与 `rust.lomt`(拼 `rust`)。后者进这一组, 根据是
+        用户 2026-09-22 的裁定「**rust 语法是 Loment 基础语法, 不需要翻译**」——
+        它抹掉之后走的是**同一条原生路**, 所以该有**同一份产物**(三个单元同一个模块名);
       * **别的拼法拒**: 参考实现是**真收**那份 `grammar python` 的(它按 Python 读),
         自举侧拒 —— 拒得说清"这门写法还没接上"(`docs/189` §4.1), **不是**"未定义的开关
         `write`"(那是把"还没接上"错报成"你写错了");
@@ -987,7 +990,7 @@ def test_m87_driver_strips_grammar_decl():
         deps = lomentc.resolve_deps(mod, ROOT, DRIVER_LOMT.parent, entry=DRIVER_LOMT)
         elf = _build_linux_elf(lomentc.emit_llvm(mod, ROOT, deps), td, "fujocs_grammar")
         outs = {}
-        for name in ("plain", "decl"):
+        for name in ("plain", "decl", "rust"):
             f = GDECL / f"{name}.lomt"
             rc, out, err = _run_driver_raw(elf, f.relative_to(ROOT).as_posix(), td, name)
             assert rc == 0, f"{name}.lomt: 自举侧退出 {rc}: {err[-300:]}"
@@ -995,8 +998,10 @@ def test_m87_driver_strips_grammar_decl():
             d = lomentc.resolve_deps(m, ROOT, f.parent, entry=f)
             assert out == lomentc.emit_llvm(m, ROOT, d), f"{name}.lomt: 产物与参考不一致"
             outs[name] = out
-        assert outs["decl"] == outs["plain"], (
-            "带着 `choose write grammar loment` 编译的产物与不带的不一样 —— 抹掉之后留痕了")
+        for name, spelling in (("decl", "loment"), ("rust", "rust")):
+            assert outs[name] == outs["plain"], (
+                f"带着 `choose write grammar {spelling}` 编译的产物与不带的不一样 —— "
+                f"抹掉之后留痕了")
         f = GDECL / "foreign.lomt"
         rc, out, err = _run_driver_raw(elf, f.relative_to(ROOT).as_posix(), td, "foreign")
         # 参考实现这份是**收**的 (拿它自己的前门按 Python 读) —— 分歧正是 docs/189 §4.1 那句话
@@ -1007,7 +1012,8 @@ def test_m87_driver_strips_grammar_decl():
         assert "自举侧收不了" in err, f"foreign.lomt: 没说到点子上: {err[:200]}"
         assert "未定义的开关" not in err, f"foreign.lomt: 报成了词法/语法错: {err[:200]}"
         assert out.strip() == "", "被拒时不该产出 IR"
-        print("      声明: 抹掉后与不带那份逐字节一致; 别的拼法拒且指对原因")
+        print("      声明: 两个原生拼法(loment/rust)抹掉后都与不带那份逐字节一致; "
+              "别的拼法拒且指对原因")
 
 
 @test
@@ -1649,6 +1655,73 @@ def test_m85_driver_gate_on_probe_cases():
         assert rc8 == 0, f'字符串字面量 "extern" 被误拒了: rc={rc8} err={err8[-300:]!r}'
         assert got8 == lomentc.emit_llvm(lomentc.load(lit_f), ROOT), "字面量 extern 的 IR 不一致"
         print('      字符串字面量 "extern": 不误判 (判的是 token kind, 不是文本)')
+
+
+@test
+def test_m85_entry_load_distinguishes_empty_file_from_directory():
+    """issue #52: 空文件、目录、路径不对, 三句话必须分得开。
+
+    `load_file` 读到 0 字节时原先一律说「路径对吗?」。空文件与目录都走那一条,
+    读者被指去查一条没问题的路径。缺文件本来就是另一句（「打不开」）, 这条不许被换掉。
+    只有注释的文件与空文件一样「没有可编译的源」, 但字节数不是 0, 仍然应当被接受
+    (issue 里点名的邻居; 不是 #45 的格式化行为)。
+    """
+    clang = _clang()
+    native = sys.platform.startswith("linux")
+    if not clang or not (native or _wsl()):
+        print("      SKIP: 需要 clang, 以及本机 Linux 或 WSL")
+        return
+    with tempfile.TemporaryDirectory() as td:
+        mod = lomentc.load(DRIVER_LOMT)
+        deps = lomentc.resolve_deps(mod, ROOT, DRIVER_LOMT.parent, entry=DRIVER_LOMT)
+        elf = _build_linux_elf(lomentc.emit_llvm(mod, ROOT, deps), td, "fujocs_empty")
+        work = Path(td)
+
+        def run(p: Path, name: str) -> tuple[int, str]:
+            if native:
+                elf.chmod(0o755)
+                r = subprocess.run([str(elf), str(p)], cwd=str(ROOT),
+                                   capture_output=True, shell=False)
+                err = r.stderr.decode("utf-8", "replace")
+                return r.returncode, err
+            # 绝对路径交给 WSL 里跑的驱动前要转成 /mnt/<drive>/…, 否则反斜杠会被
+            # bash 吃掉 (与本文件其它传绝对路径的判据同一条约定)
+            rc, _out, err = _run_driver_raw(elf, _wsl_path(p), td, name)
+            return rc, err
+
+        empty = work / "zero.lomt"
+        empty.write_bytes(b"")
+        rc, err = run(empty, "empty")
+        assert rc == 1, f"空文件应当退 1, 得到 {rc}: {err[:300]}"
+        assert "空文件" in err, f"空文件没说自己是空的: {err[:300]}"
+        assert "路径对吗" not in err, f"空文件仍被说成路径问题: {err[:300]}"
+        assert "目录" not in err, f"空文件被说成目录: {err[:300]}"
+
+        rc, err = run(work, "dir")
+        assert rc == 1, f"目录应当退 1, 得到 {rc}: {err[:300]}"
+        assert "目录" in err, f"目录没说自己是目录: {err[:300]}"
+        assert "路径对吗" not in err, f"目录仍被说成路径问题: {err[:300]}"
+        assert "空文件" not in err, f"目录被说成空文件: {err[:300]}"
+
+        missing = work / "no-such-entry.lomt"
+        rc, err = run(missing, "missing")
+        assert rc == 1, f"缺文件应当退 1, 得到 {rc}: {err[:300]}"
+        assert "打不开" in err, f"缺文件不再报「打不开」: {err[:300]}"
+        assert "空文件" not in err and "目录" not in err, (
+            f"缺文件被说成空文件或目录: {err[:300]}")
+
+        comment = work / "comment.lomt"
+        comment.write_text("// only a comment\n", encoding="utf-8", newline="\n")
+        rc, err = run(comment, "comment")
+        assert rc == 0, f"只有注释的文件应当被接受, 得到 {rc}: {err[:300]}"
+        assert "空文件" not in err and "路径对吗" not in err, err[:300]
+
+        real = work / "one.lomt"
+        real.write_text("module m\n\nfn f() -> u32 {\n    return 1;\n}\n",
+                        encoding="utf-8", newline="\n")
+        rc, err = run(real, "real")
+        assert rc == 0, f"非空源文件不该被入口装载拒绝: {rc}: {err[:300]}"
+        print("      入口装载: 空文件 / 目录 / 缺路径 三句话分开, 注释文件仍接受")
 
 
 def _gap_breakdown(diff: list[str]) -> dict[str, list[str]]:
